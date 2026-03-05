@@ -1,0 +1,75 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/hello-world
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/hello-world-dev-cluster-github-actions
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: vars
+        run: echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build -t $ECR_REPOSITORY:${{ steps.vars.outputs.sha }} \
+                       -t $ECR_REPOSITORY:latest .
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push $ECR_REPOSITORY:${{ steps.vars.outputs.sha }}
+          docker push $ECR_REPOSITORY:latest
+
+      - name: Update image tag in deployments repo
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOYMENTS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key" \
+          git clone git@github.com:Shlomi-Lantser/hello-world-deployments.git
+
+          cd hello-world-deployments
+          sed -i 's|tag:.*|tag: "'"${{ steps.vars.outputs.sha }}"'"|' \
+            charts/hello-world/values.yaml
+
+          git config user.email "ci@github.com"
+          git config user.name "GitHub Actions"
+          git add charts/hello-world/values.yaml
+          git commit -m "ci: update image tag to ${{ steps.vars.outputs.sha }}"
+
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key" git push
+
+      - name: Summary
+        run: |
+          echo "### ✅ Image pushed to ECR" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository:** $ECR_REPOSITORY" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tags:** \`${{ steps.vars.outputs.sha }}\`, \`latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- ArgoCD will auto-sync the new tag from hello-world-deployments" >> $GITHUB_STEP_SUMMARY
